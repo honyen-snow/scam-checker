@@ -11,14 +11,18 @@ from dotenv import load_dotenv
 from PIL import Image
 
 import google.generativeai as genai
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # =========================
 # 1) 政府/外部黑名單來源（請在這裡填入）
 # =========================
 #
 # 你未來只要把這個變數改成「165 反詐騙假網站」公開資料的 JSON/CSV 連結即可。
-# 例如：資料開放平台的 API 端點、或直接可下載的 CSV/JSON 檔。
-BLACKLIST_SOURCE_URL = ""  # <-- TODO: 填入真實黑名單網址（JSON 或 CSV）
+# 例如：資料開放平台的 API 端點、或直接可下載的 CSV 檔。
+# 目前先放一個標準 CSV 連結佔位符，之後你可以自行改成 data.gov.tw 上 165 黑名單的真實 CSV 下載網址。
+BLACKLIST_SOURCE_URL = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/29E8E643-88ED-4952-B21E-BD42A3B7108C/resource/C0FCAC14-F724-406E-9061-119D2C82327B/download"
 
 # 常見可疑關鍵字（特徵防護）。你之後也可以自己再加。
 SUSPICIOUS_KEYWORDS: list[str] = [
@@ -84,6 +88,13 @@ GEMINI_SYSTEM_PROMPT = (
     "你是一位台灣警政署 165 級別的防詐騙專家。請掃描這張圖片，判斷是否包含詐騙特徵"
     "（例如：不合理的獲利保證、假冒的官方機構、要求提供密碼或匯款、可疑的網址、或是常見的詐騙話術等）。"
     "請用繁體中文給出簡潔、條理分明的分析，並給出『高度危險』、『有疑慮』或『目前無明顯特徵』的結論。"
+)
+
+GEMINI_URL_SYSTEM_PROMPT = (
+    "你是一位台灣警政署 165 級別的防詐騙專家。你會收到系統整理好的網址檢查情報，"
+    "其中包含是否命中 165 詐騙黑名單、命中的可疑關鍵字、網域與其他技術細節。"
+    "請先充分理解這些背景情報，再用溫暖、專業、具同理心且條理分明的繁體中文，"
+    "寫給一般民眾看的防詐騙分析報告；若風險較高要明確提醒與給建議，若目前看起來安全也要提醒保持警覺。"
 )
 
 
@@ -160,13 +171,14 @@ def _extract_urls_from_csv_text(csv_text: str) -> list[str]:
     return [v for v in all_vals if v and ("://" in v or "." in v)]
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_external_blacklist(source_url: str) -> tuple[set[str], str]:
     if not source_url.strip():
         return set(), "尚未設定黑名單來源網址（目前只用關鍵字特徵比對）。"
 
     try:
-        resp = requests.get(source_url, timeout=15)
+        # 忽略 SSL 憑證驗證，以避免部分政府站台憑證設定問題導致錯誤
+        resp = requests.get(source_url, timeout=15, verify=False)
         resp.raise_for_status()
     except Exception as e:
         return set(), f"黑名單下載失敗：{e}"
@@ -235,7 +247,61 @@ def _pick_risk_level(text: str) -> str:
     return "有疑慮"
 
 
-def analyze_image_with_gemini(*, image_file, model_name: str, api_key: str) -> dict:
+def analyze_url_with_gemini(
+    *,
+    raw_url: str,
+    details: dict,
+    model_name: str,
+    api_key: str,
+) -> str:
+    """根據網址檢查結果，請 Gemini 產生溫暖的說明報告。"""
+    cleaned = details.get("cleaned") or raw_url or ""
+    normalized_url = details.get("normalized_url") or "（無法正規化）"
+    domain = details.get("normalized_domain") or "（無法解析）"
+    in_blacklist = details.get("in_blacklist")
+    hits = details.get("keyword_hits") or []
+
+    blacklist_text = "是，已命中 165 詐騙黑名單。" if in_blacklist else "否，目前沒有出現在 165 詐騙黑名單中。"
+    keyword_text = "、".join(hits) if hits else "無明顯命中的可疑關鍵字。"
+
+    suspicion_flag = "較高" if in_blacklist or hits else "較低（目前沒有明顯異常）"
+
+    system_summary = (
+        "以下是系統對使用者輸入網址所做的技術性檢查結果整理：\n"
+        f"- 使用者原始輸入網址：{cleaned}\n"
+        f"- 正規化後的網址：{normalized_url}\n"
+        f"- 判定的網域：{domain}\n"
+        f"- 是否命中 165 詐騙黑名單：{blacklist_text}\n"
+        f"- 命中的可疑關鍵字：{keyword_text}\n"
+        f"- 綜合技術判斷的風險粗略評估：{suspicion_flag}\n"
+    )
+
+    user_prompt = (
+        system_summary
+        + "\n\n請你站在 165 防詐專家的角度，"
+        "用溫暖、專業、具同理心且條理分明的繁體中文，"
+        "寫一份給民眾看的分析報告，說明：\n"
+        "1) 這種網址可能涉及的風險與常見詐騙手法（若看起來較安全，也請說明為何、以及仍需注意的點）。\n"
+        "2) 使用者現在應該具體採取的 3-5 個安全步驟（例如不要點開、不要登入、改用官方網址查詢、撥打 165 等）。\n"
+        "3) 用簡短的一段話，給予使用者情緒上的安撫與鼓勵，強調願意求證是很重要的一步。\n"
+    )
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=GEMINI_URL_SYSTEM_PROMPT,
+    )
+    resp = model.generate_content(user_prompt)
+    return (getattr(resp, "text", None) or "").strip()
+
+
+def analyze_image_with_gemini(
+    *,
+    image_file,
+    model_name: str,
+    api_key: str,
+    retrieval_note: str | None = None,
+) -> dict:
     img_bytes = image_file.getvalue()
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img.thumbnail((1280, 1280))
@@ -246,13 +312,23 @@ def analyze_image_with_gemini(*, image_file, model_name: str, api_key: str) -> d
         system_instruction=GEMINI_SYSTEM_PROMPT,
     )
 
-    user_prompt = (
+    base_prompt = (
         "請分析這張圖片是否有詐騙特徵，並用繁體中文輸出：\n"
         "1) 結論：三選一（高度危險／有疑慮／目前無明顯特徵）\n"
         "2) 主要理由：條列 3-8 點\n"
         "3) 圖中可疑資訊（若有）：可疑網址/網域、電話、LINE ID、要求匯款方式等\n"
         "4) 建議下一步：給 3 點具體建議（例如不要點連結、改用官方管道查證、撥打 165 等）\n"
     )
+
+    if retrieval_note:
+        user_prompt = (
+            base_prompt
+            + "\n\n系統背景檢索結果："
+            + retrieval_note
+            + "\n請結合上述背景情報與圖片內容，一併納入整體風險評估中。"
+        )
+    else:
+        user_prompt = base_prompt
 
     resp = model.generate_content([user_prompt, img])
     report_text = (getattr(resp, "text", None) or "").strip()
@@ -349,6 +425,30 @@ with tab_url:
                 if details["keyword_hits"]:
                     st.write("**命中的可疑特徵：** " + "、".join(details["keyword_hits"]))
 
+            # 讓 Gemini 針對上述技術結果，產生溫暖且具同理心的分析報告
+            if gemini_api_key:
+                with st.spinner("🧠 Gemini 正在撰寫網址分析報告..."):
+                    try:
+                        url_report = analyze_url_with_gemini(
+                            raw_url=url,
+                            details=details,
+                            model_name=gemini_model,
+                            api_key=gemini_api_key,
+                        )
+                    except Exception as e:
+                        url_report = ""
+                        st.warning(f"AI 報告生成失敗：{e}")
+
+                if url_report:
+                    st.markdown("### 🤖 AI 防詐騙分析報告")
+                    if suspicious:
+                        st.error("🚨 綜合評估：此網址具有明顯風險，請務必提高警覺。")
+                    else:
+                        st.success("💡 綜合評估：目前沒有明顯高風險特徵，但仍建議保持基本警覺。")
+                    st.markdown(url_report)
+            else:
+                st.caption("（尚未設定 Gemini API Key，因此僅顯示系統比對結果。）")
+
 with tab_image:
     st.markdown("### 🖼️ 上傳圖片或截圖")
     uploaded_file = st.file_uploader(
@@ -358,7 +458,18 @@ with tab_image:
     )
 
     if uploaded_file is not None:
+        # 如果使用者重新上傳不同的圖片，清除舊的分析結果
+        file_signature = f"{getattr(uploaded_file, 'name', '')}:{getattr(uploaded_file, 'size', '')}"
+        prev_signature = st.session_state.get("last_image_file_sig")
+        if file_signature != prev_signature:
+            st.session_state["last_image_file_sig"] = file_signature
+            st.session_state["last_image_result"] = None
+
         st.image(uploaded_file, caption="上傳的圖片預覽", width=400)
+        url_in_image = st.text_input(
+            "（選填）圖片中出現的網址或連結：",
+            placeholder="例如：https://bank.example.com/login",
+        )
         action_l, action_r = st.columns([1, 2], vertical_alignment="center")
         with action_l:
             run_img = st.button("🔍 分析圖片內容", use_container_width=True)
@@ -369,12 +480,29 @@ with tab_image:
             if not gemini_api_key:
                 st.error("❌ 找不到 Gemini API Key。請先建立 `.env` 並設定 `GEMINI_API_KEY=你的金鑰`，再重新啟動 Streamlit。")
             else:
+                retrieval_note = "未提供明確網址，僅依圖片內容進行判斷。"
+                url_in_image_clean = (url_in_image or "").strip()
+                if url_in_image_clean:
+                    _, url_details = check_url(url_in_image_clean, blacklist)
+                    if url_details["in_blacklist"]:
+                        retrieval_note = (
+                            "此網址已列入警政署 165 詐騙黑名單"
+                            f"（網域：{url_details['normalized_domain'] or '未知'}）。"
+                        )
+                    else:
+                        retrieval_note = (
+                            "此網址目前未出現在警政署 165 詐騙黑名單中"
+                            f"（網域：{url_details['normalized_domain'] or '未知'}），"
+                            "但仍可能存在風險，請結合圖片內容與其他線索謹慎評估。"
+                        )
+
                 with st.spinner("🧠 Gemini 分析中，請稍候..."):
                     try:
                         result = analyze_image_with_gemini(
                             image_file=uploaded_file,
                             model_name=gemini_model,
                             api_key=gemini_api_key,
+                            retrieval_note=retrieval_note,
                         )
                         st.session_state["last_image_result"] = result
                     except Exception as e:
