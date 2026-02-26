@@ -22,7 +22,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # 你未來只要把這個變數改成「165 反詐騙假網站」公開資料的 JSON/CSV 連結即可。
 # 例如：資料開放平台的 API 端點、或直接可下載的 CSV 檔。
 # 目前先放一個標準 CSV 連結佔位符，之後你可以自行改成 data.gov.tw 上 165 黑名單的真實 CSV 下載網址。
-BLACKLIST_SOURCE_URL = "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/29E8E643-88ED-4952-B21E-BD42A3B7108C/resource/C0FCAC14-F724-406E-9061-119D2C82327B/download"
+BLACKLIST_SOURCE_URL = "165_blacklist.csv"
 
 # 常見可疑關鍵字（特徵防護）。你之後也可以自己再加。
 SUSPICIOUS_KEYWORDS: list[str] = [
@@ -151,8 +151,7 @@ def _extract_urls_from_json(data: object) -> list[str]:
     return results
 
 
-def _extract_urls_from_csv_text(csv_text: str) -> list[str]:
-    df = pd.read_csv(io.StringIO(csv_text))
+def _extract_urls_from_csv_df(df: pd.DataFrame) -> list[str]:
     lower_to_col = {str(c).strip().lower(): c for c in df.columns}
 
     for key in POSSIBLE_URL_FIELDS:
@@ -161,45 +160,54 @@ def _extract_urls_from_csv_text(csv_text: str) -> list[str]:
             series = df[c].dropna().astype(str)
             return series.tolist()
 
-    all_vals = (
-        df.astype(str)
-        .replace("nan", "")
-        .values
-        .ravel()
-        .tolist()
-    )
+    all_vals = df.astype(str).replace("nan", "").values.ravel().tolist()
     return [v for v in all_vals if v and ("://" in v or "." in v)]
+
+
+def _extract_urls_from_csv_text(csv_text: str) -> list[str]:
+    df = pd.read_csv(io.StringIO(csv_text))
+    return _extract_urls_from_csv_df(df)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_external_blacklist(source_url: str) -> tuple[set[str], str]:
-    if not source_url.strip():
+    src = (source_url or "").strip()
+    if not src:
         return set(), "尚未設定黑名單來源網址（目前只用關鍵字特徵比對）。"
 
-    try:
-        # 忽略 SSL 憑證驗證，以避免部分政府站台憑證設定問題導致錯誤
-        resp = requests.get(source_url, timeout=15, verify=False)
-        resp.raise_for_status()
-    except Exception as e:
-        return set(), f"黑名單下載失敗：{e}"
-
-    content_type = (resp.headers.get("content-type") or "").lower()
-    text = resp.text
-
     candidates: list[str] = []
-    if "application/json" in content_type or source_url.lower().endswith(".json"):
+    # 遠端 URL（http/https）：用 requests 抓取
+    if src.startswith("http://") or src.startswith("https://"):
         try:
-            candidates = _extract_urls_from_json(resp.json())
+            # 忽略 SSL 憑證驗證，以避免部分政府站台憑證設定問題導致錯誤
+            resp = requests.get(src, timeout=15, verify=False)
+            resp.raise_for_status()
         except Exception as e:
-            return set(), f"黑名單 JSON 解析失敗：{e}"
-    else:
-        try:
-            candidates = _extract_urls_from_csv_text(text)
-        except Exception:
+            return set(), f"黑名單下載失敗：{e}"
+
+        content_type = (resp.headers.get("content-type") or "").lower()
+        text = resp.text
+
+        if "application/json" in content_type or src.lower().endswith(".json"):
             try:
                 candidates = _extract_urls_from_json(resp.json())
             except Exception as e:
-                return set(), f"黑名單解析失敗（非 JSON/CSV 或格式不符）：{e}"
+                return set(), f"黑名單 JSON 解析失敗：{e}"
+        else:
+            try:
+                candidates = _extract_urls_from_csv_text(text)
+            except Exception:
+                try:
+                    candidates = _extract_urls_from_json(resp.json())
+                except Exception as e:
+                    return set(), f"黑名單解析失敗（非 JSON/CSV 或格式不符）：{e}"
+    # 其他情況：視為本機檔案路徑，用 pandas 直接讀取 CSV
+    else:
+        try:
+            df = pd.read_csv(src)
+        except Exception as e:
+            return set(), f"本機黑名單 CSV 載入失敗：{e}"
+        candidates = _extract_urls_from_csv_df(df)
 
     normalized: set[str] = set()
     for item in candidates:
