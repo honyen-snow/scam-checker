@@ -701,26 +701,32 @@ with tab_sms:
             else:
                 st.success(f"✅ {sms_category}\n\n{sms_analysis}")
 
-            if urls_in_sms:
-                with st.expander("🔍 系統偵測到的網址與黑名單比對結果"):
+            with st.expander("⚙️ 系統檢測技術摘要 (供家屬參考)"):
+                st.write(f"**AI 判定標籤類別：** {sms_category}")
+
+                if urls_in_sms:
+                    st.write("**原始訊息中偵測到的網址：**")
+                    for info in url_summaries:
+                        u = info.get("original_url") or ""
+                        st.write(f"- `{u}`")
+                else:
+                    st.write("**原始訊息中未偵測到明顯的網址。**")
+
+                st.write("**165 黑名單與關鍵字比對結果：**")
+                if urls_in_sms:
                     for info in url_summaries:
                         u = info.get("original_url") or ""
                         domain = info.get("normalized_domain") or "（無法解析）"
                         in_blacklist = info.get("in_blacklist")
                         hits = info.get("keyword_hits") or []
-                        st.write(f"- **網址**：`{u}`")
+                        st.write(f"- 網址：`{u}`")
                         st.write(f"  - 網域：`{domain}`")
                         st.write(f"  - 是否在 165 黑名單：{'是' if in_blacklist else '否'}")
                         if hits:
                             st.write(f"  - 命中的可疑關鍵字：{'、'.join(hits)}")
                         st.write("---")
-            else:
-                st.caption("系統沒有在這則訊息中偵測到明顯的網址。")
-
-            # 保留一個可展開的完整說明區（以免主畫面太長）
-            if sms_analysis:
-                with st.expander("🧾 查看完整分析內容（點我展開）"):
-                    st.markdown(sms_analysis)
+                else:
+                    st.write("目前沒有網址可供 165 黑名單比對。")
 
 with st.expander("🧠 這個工具是如何運作的？（點我展開）"):
     st.markdown(
