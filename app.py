@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from urllib.parse import urlparse
 
@@ -99,11 +100,16 @@ GEMINI_URL_SYSTEM_PROMPT = (
 )
 
 GEMINI_SMS_SYSTEM_PROMPT = (
-    "你是一位台灣警政署 165 級別的防詐騙專家。你會收到一段疑似詐騙的簡訊或 LINE 訊息，"
-    "以及系統針對其中網址做的技術性比對結果。"
-    "請用溫暖、有耐心、同理心強、條理清楚且盡量少用艱深科技術語的繁體中文來說明，"
-    "讀者多為一般民眾與視力可能較退化的長者。"
-    "請在報告最後明確給出『高度危險』、『有疑慮』或『目前無明顯特徵』三種之一的結論。"
+    "你是一位『溫暖的銀髮族資訊守門員』，專門協助長者判斷收到的簡訊或 LINE 訊息是否安全。"
+    "你會收到：1) 使用者貼上的訊息原文 2) 系統針對訊息內網址做的比對結果（是否命中 165 黑名單、可疑關鍵字）。\n\n"
+    "請嚴格遵循以下分類規則（只能三選一）：\n"
+    "『🔴 詐騙高風險』：只要內容涉及要求匯款、點擊不明網址、索取驗證碼/個資、宣稱中獎或穩賺不賠的投資。\n"
+    "『🟡 健康謠言/假新聞』：內容沒有直接騙錢，但包含誇大的健康恐嚇、未經證實的偏方、或偽造的政府/社會政策。\n"
+    "『🟢 安全與日常資訊』：一般的早安圖文字、真實的新聞、或是無害的親友問候。\n\n"
+    "輸出格式必須是『乾淨 JSON』，只能包含兩個欄位：\n"
+    '- \"category\"：只能是上述三種標籤其中一個（完全一致）。\n'
+    '- \"analysis\"：用對待長輩般親切、好懂的白話文，解釋為什麼這樣分類並給建議，約 100-150 字。\n\n'
+    "非常重要：只輸出 JSON，不要加任何多餘文字、不要 Markdown、不要程式碼區塊。"
 )
 
 
@@ -343,7 +349,7 @@ def analyze_sms_with_gemini(
     model_name: str,
     api_key: str,
 ) -> tuple[str, str]:
-    """根據簡訊內容與黑名單比對結果，請 Gemini 給出分析與結論。"""
+    """根據簡訊內容與黑名單比對結果，請 Gemini 輸出 JSON 分類與分析。"""
     if not url_summaries:
         urls_section = "系統沒有在訊息中偵測到明確的網址或連結。"
     else:
@@ -360,22 +366,18 @@ def analyze_sms_with_gemini(
             )
         urls_section = "\n".join(lines)
 
-    technical_summary = (
-        "【系統技術檢查摘要】\n"
+    background_summary = (
+        "【系統背景比對結果（供你參考）】\n"
         + urls_section
         + "\n\n"
-        "請你參考以上技術檢查結果，再結合下一段的訊息原文，幫助使用者判斷風險。"
+        "提醒：網址有沒有出現在黑名單，只是線索之一；仍需結合訊息內容整體判斷。"
     )
 
     user_prompt = (
-        technical_summary
+        background_summary
         + "\n\n【使用者貼上的簡訊 / LINE 訊息原文】\n"
         + sms_text
-        + "\n\n請你：\n"
-        "1) 用淺顯易懂的語言，說明這則訊息可能涉及的風險與常見詐騙手法（若目前看起來風險不高，也請說明原因以及仍需注意的地方）。\n"
-        "2) 列出 3-5 個具體建議步驟，告訴使用者現在應該怎麼做比較安全。\n"
-        "3) 在最後明確寫出一句『結論：XXX』，其中 XXX 必須是「高度危險」、「有疑慮」或「目前無明顯特徵」三選一。\n"
-        "4) 全程請使用繁體中文，語氣溫暖、有同理心，適合一般民眾與長者閱讀。\n"
+        + "\n\n請依照系統提示的三分類規則輸出 JSON。"
     )
 
     genai.configure(api_key=api_key)
@@ -384,9 +386,38 @@ def analyze_sms_with_gemini(
         system_instruction=GEMINI_SMS_SYSTEM_PROMPT,
     )
     resp = model.generate_content(user_prompt)
-    report = (getattr(resp, "text", None) or "").strip()
-    risk_label = _pick_risk_level(report)
-    return risk_label, report
+    raw = (getattr(resp, "text", None) or "").strip()
+
+    def _parse_json(text: str) -> dict | None:
+        t = (text or "").strip()
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = re.sub(r"\s*```$", "", t).strip()
+        if not t:
+            return None
+        try:
+            return json.loads(t)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", t)
+            if not m:
+                return None
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+
+    parsed = _parse_json(raw) or {}
+    category = (parsed.get("category") or "").strip()
+    analysis = (parsed.get("analysis") or "").strip()
+
+    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🟢 安全與日常資訊"}
+    if category not in allowed:
+        category = "🟡 健康謠言/假新聞" if raw else "🟡 健康謠言/假新聞"
+
+    if not analysis:
+        analysis = raw or "（AI 沒有回傳可解析的 JSON 內容，建議稍後再試一次。）"
+
+    return category, analysis
 
 
 def analyze_image_with_gemini(
@@ -652,23 +683,23 @@ with tab_sms:
 
             with st.spinner("🧠 Gemini 正在閱讀這則訊息並進行防詐分析..."):
                 try:
-                    sms_risk, sms_report = analyze_sms_with_gemini(
+                    sms_category, sms_analysis = analyze_sms_with_gemini(
                         sms_text=sms_text,
                         url_summaries=url_summaries,
                         model_name=gemini_model,
                         api_key=gemini_api_key,
                     )
                 except Exception as e:
-                    sms_risk, sms_report = "有疑慮", ""
+                    sms_category, sms_analysis = "🟡 健康謠言/假新聞", ""
                     st.error(f"分析失敗：{e}")
 
-            # 先用醒目的顏色與大表情符號顯示結論
-            if sms_risk == "高度危險":
-                st.error("🚨 判定：這則訊息具有高度詐騙風險，務必不要依照內容操作。")
-            elif sms_risk == "目前無明顯特徵":
-                st.success("✅ 判定：目前未見明顯詐騙特徵，但仍請保持警覺。")
+            # 依 category 用不同顏色與大表情符號呈現（長者友善）
+            if sms_category == "🔴 詐騙高風險":
+                st.error(f"🚨 {sms_category}\n\n{sms_analysis}")
+            elif sms_category == "🟡 健康謠言/假新聞":
+                st.warning(f"⚠️ {sms_category}\n\n{sms_analysis}")
             else:
-                st.warning("⚠️ 判定：這則訊息有疑慮，請提高警覺並再次求證。")
+                st.success(f"✅ {sms_category}\n\n{sms_analysis}")
 
             if urls_in_sms:
                 with st.expander("🔍 系統偵測到的網址與黑名單比對結果"):
@@ -686,9 +717,10 @@ with tab_sms:
             else:
                 st.caption("系統沒有在這則訊息中偵測到明顯的網址。")
 
-            if sms_report:
-                st.markdown("### 🤖 AI 防詐騙說明")
-                st.markdown(sms_report)
+            # 保留一個可展開的完整說明區（以免主畫面太長）
+            if sms_analysis:
+                with st.expander("🧾 查看完整分析內容（點我展開）"):
+                    st.markdown(sms_analysis)
 
 with st.expander("🧠 這個工具是如何運作的？（點我展開）"):
     st.markdown(
