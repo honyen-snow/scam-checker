@@ -13,6 +13,7 @@ from PIL import Image
 import re
 
 import google.generativeai as genai
+from duckduckgo_search import DDGS
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -221,6 +222,38 @@ def extract_urls_from_text(text: str) -> list[str]:
     return sorted(urls)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def live_fact_check(query: str) -> str:
+    """使用 DuckDuckGo 對台灣官方查核站做即時查詢，回傳精簡文字摘要。"""
+    q = (query or "").strip()
+    if not q:
+        return "（未提供足夠關鍵字，略過即時查核。）"
+
+    search_query = (
+        f"{q} site:mohw.gov.tw OR site:165.npa.gov.tw OR site:tfc-taiwan.org.tw"
+    )
+
+    try:
+        with DDGS(timeout=10) as ddgs:
+            results = list(ddgs.text(search_query, max_results=3))
+    except Exception as e:
+        return f"（即時查核失敗：{e}）"
+
+    if not results:
+        return "（在衛福部、165 防詐網或台灣事實查核中心暫時找不到明確相關的查核資料。）"
+
+    lines: list[str] = []
+    for idx, r in enumerate(results, start=1):
+        title = r.get("title") or ""
+        snippet = r.get("body") or r.get("description") or ""
+        url = r.get("href") or r.get("url") or ""
+        lines.append(
+            f"{idx}. {title}\n   摘要：{snippet}\n   來源：{url}"
+        )
+
+    return "\n".join(lines)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_external_blacklist(source_url: str) -> tuple[set[str], str]:
     src = (source_url or "").strip()
@@ -359,6 +392,7 @@ def analyze_sms_with_gemini(
     *,
     sms_text: str,
     url_summaries: list[dict],
+    context: str,
     model_name: str,
     api_key: str,
 ) -> tuple[str, str]:
@@ -386,8 +420,12 @@ def analyze_sms_with_gemini(
         "提醒：網址有沒有出現在黑名單，只是線索之一；仍需結合訊息內容整體判斷。"
     )
 
+    context_note = context or "（目前沒有額外的官方即時查核資料。）"
+
     user_prompt = (
         background_summary
+        + "\n\n【即時查核取得的官方資料摘要（供你優先參考）】\n"
+        + context_note
         + "\n\n【使用者貼上的簡訊 / LINE 訊息原文】\n"
         + sms_text
         + "\n\n請依照系統提示的三分類規則輸出 JSON。"
@@ -482,6 +520,7 @@ def analyze_image_with_gemini(
 def analyze_audio_with_gemini(
     *,
     audio_file,
+    context: str,
     model_name: str,
     api_key: str,
 ) -> tuple[str, str]:
@@ -503,7 +542,12 @@ def analyze_audio_with_gemini(
         "data": audio_bytes,
     }
 
-    user_prompt = "請依照系統提示的三分類規則輸出 JSON。"
+    context_note = context or "（目前沒有額外的官方即時查核資料。）"
+    user_prompt = (
+        "【即時查核取得的官方資料摘要（供你優先參考）】\n"
+        + context_note
+        + "\n\n請依照系統提示的三分類規則輸出 JSON。"
+    )
 
     resp = model.generate_content([audio_part, user_prompt])
     raw = (getattr(resp, "text", None) or "").strip()
@@ -755,11 +799,15 @@ with tab_sms:
                 d_with_original["original_url"] = u
                 url_summaries.append(d_with_original)
 
+            st.info("🔍 正在連線至衛福部與警政署資料庫進行即時查核...")
+            fact_context = live_fact_check(sms_text)
+
             with st.spinner("🧠 Gemini 正在閱讀這則訊息並進行防詐分析..."):
                 try:
                     sms_category, sms_analysis = analyze_sms_with_gemini(
                         sms_text=sms_text,
                         url_summaries=url_summaries,
+                        context=fact_context,
                         model_name=gemini_model,
                         api_key=gemini_api_key,
                     )
@@ -818,10 +866,15 @@ with tab_audio:
         elif not gemini_api_key:
             st.warning("⚠️ 尚未設定 Gemini API Key，無法進行語音分析。請先在 `.env` 中設定 `GEMINI_API_KEY`。")
         else:
+            st.info("🔍 正在連線至衛福部與警政署資料庫進行即時查核...")
+            # 目前沒有語音文字內容可用來當查詢，先用通用關鍵字做基本查核
+            fact_context = live_fact_check("語音 詐騙 闢謠")
+
             with st.spinner("🧠 正在仔細聆聽並分析語音內容，請稍候..."):
                 try:
                     audio_category, audio_analysis = analyze_audio_with_gemini(
                         audio_file=audio_data,
+                        context=fact_context,
                         model_name=gemini_model,
                         api_key=gemini_api_key,
                     )
