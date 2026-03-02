@@ -88,9 +88,18 @@ GEMINI_API_ENV_VAR = "GEMINI_API_KEY"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 GEMINI_SYSTEM_PROMPT = (
-    "你是一位台灣警政署 165 級別的防詐騙專家。請掃描這張圖片，判斷是否包含詐騙特徵"
-    "（例如：不合理的獲利保證、假冒的官方機構、要求提供密碼或匯款、可疑的網址、或是常見的詐騙話術等）。"
-    "請用繁體中文給出簡潔、條理分明的分析，並給出『高度危險』、『有疑慮』或『目前無明顯特徵』的結論。"
+    "你是一位台灣警政署 165 級別的防詐騙專家。請仔細掃描這張圖片，判斷是否包含詐騙特徵、健康謠言、"
+    "帶風向/情緒煽動的內容，或只是一般安全的日常資訊。\n\n"
+    "請嚴格依照以下標籤分類（只能四選一）：\n"
+    "『🔴 詐騙高風險』：內容涉及要求匯款、點擊不明網址、索取驗證碼/個資、宣稱中獎或穩賺不賠的投資。\n"
+    "『🟡 健康謠言/假新聞』：與健康或公共政策相關，但內容誇大恐嚇、未經證實、或偽造政府/權威單位說法。\n"
+    "『🔵 帶風向/情緒煽動疑慮』：內容未必直接詐騙或健康謠言，但充滿強烈情緒字眼、試圖挑起社會對立、"
+    "使用誇大聳動標題、或具有明顯網軍操作特徵。\n"
+    "『🟢 安全與日常資訊』：一般的早安圖文字、真實新聞截圖、或無害的親友問候。\n\n"
+    "輸出格式必須是乾淨 JSON，只能包含：\n"
+    '- \"category\"：上述四種標籤之一（完全一致）。\n'
+    '- \"analysis\"：用對待長輩般親切、好懂的白話文（約 100-150 字），說明為什麼這樣分類並給出建議。\n\n'
+    "請不要輸出任何額外說明或 Markdown，只輸出 JSON。"
 )
 
 GEMINI_URL_SYSTEM_PROMPT = (
@@ -481,7 +490,7 @@ def analyze_image_with_gemini(
     model_name: str,
     api_key: str,
     retrieval_note: str | None = None,
-) -> dict:
+) -> tuple[str, str]:
     img_bytes = image_file.getvalue()
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     img.thumbnail((1280, 1280))
@@ -493,32 +502,52 @@ def analyze_image_with_gemini(
     )
 
     base_prompt = (
-        "請分析這張圖片是否有詐騙特徵，並用繁體中文輸出：\n"
-        "1) 結論：三選一（高度危險／有疑慮／目前無明顯特徵）\n"
-        "2) 主要理由：條列 3-8 點\n"
-        "3) 圖中可疑資訊（若有）：可疑網址/網域、電話、LINE ID、要求匯款方式等\n"
-        "4) 建議下一步：給 3 點具體建議（例如不要點連結、改用官方管道查證、撥打 165 等）\n"
+        "請分析這張圖片的內容，判斷是否與詐騙、健康謠言、帶風向/情緒煽動或一般安全日常資訊有關。\n"
+        "請依照系統提示的四種分類標籤輸出 JSON。"
     )
 
     if retrieval_note:
         user_prompt = (
             base_prompt
-            + "\n\n系統背景檢索結果："
+            + "\n\n【系統背景檢索結果（供你參考）】\n"
             + retrieval_note
-            + "\n請結合上述背景情報與圖片內容，一併納入整體風險評估中。"
         )
     else:
         user_prompt = base_prompt
 
     resp = model.generate_content([user_prompt, img])
-    report_text = (getattr(resp, "text", None) or "").strip()
+    raw = (getattr(resp, "text", None) or "").strip()
 
-    risk = _pick_risk_level(report_text)
-    return {
-        "risk": risk,
-        "report": report_text or "（模型未回傳可顯示的文字內容）",
-        "model": model_name,
-    }
+    def _parse_json(text: str) -> dict | None:
+        t = (text or "").strip()
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = re.sub(r"\s*```$", "", t).strip()
+        if not t:
+            return None
+        try:
+            return json.loads(t)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", t)
+            if not m:
+                return None
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+
+    parsed = _parse_json(raw) or {}
+    category = (parsed.get("category") or "").strip()
+    analysis = (parsed.get("analysis") or "").strip()
+
+    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🔵 帶風向/情緒煽動疑慮", "🟢 安全與日常資訊"}
+    if category not in allowed:
+        category = "🟡 健康謠言/假新聞"
+
+    if not analysis:
+        analysis = raw or "（AI 沒有回傳可解析的 JSON 內容，建議稍後再試一次。）"
+
+    return category, analysis
 
 
 def analyze_audio_with_gemini(
@@ -617,7 +646,7 @@ with st.sidebar:
     st.markdown("### 🤖 圖片分析（Gemini）")
     gemini_model = st.selectbox(
         "模型",
-        options=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.0-flash", "gemini-3.1-pro"],
+        options=["gemini-2.5-flash", "gemini-2.5-pro"],
         index=0,
     )
     if gemini_api_key:
@@ -747,32 +776,30 @@ with tab_image:
 
                 with st.spinner("🧠 Gemini 分析中，請稍候..."):
                     try:
-                        result = analyze_image_with_gemini(
+                        img_category, img_analysis = analyze_image_with_gemini(
                             image_file=uploaded_file,
                             model_name=gemini_model,
                             api_key=gemini_api_key,
                             retrieval_note=retrieval_note,
                         )
-                        st.session_state["last_image_result"] = result
+                        st.session_state["last_image_result"] = (img_category, img_analysis)
                     except Exception as e:
                         st.session_state["last_image_result"] = None
                         st.error(f"分析失敗：{e}")
 
         result = st.session_state.get("last_image_result")
         if result:
-            risk = result.get("risk", "有疑慮")
-            report = result.get("report", "")
+            img_category, img_analysis = result
 
-            st.markdown("### 📋 AI 分析報告")
-            if risk == "高度危險":
-                st.error(f"🚨 結論：**{risk}**")
-            elif risk == "目前無明顯特徵":
-                st.success(f"✅ 結論：**{risk}**")
+            st.markdown("### 📋 AI 圖片分析報告")
+            if img_category == "🔴 詐騙高風險":
+                st.error(f"🚨 {img_category}\n\n{img_analysis}")
+            elif img_category == "🟡 健康謠言/假新聞":
+                st.warning(f"⚠️ {img_category}\n\n{img_analysis}")
+            elif img_category == "🔵 帶風向/情緒煽動疑慮":
+                st.info(f"ℹ️ {img_category}\n\n{img_analysis}")
             else:
-                st.warning(f"⚠️ 結論：**{risk}**")
-
-            st.markdown(report)
-            st.caption(f"模型：`{result.get('model', gemini_model)}`")
+                st.success(f"✅ {img_category}\n\n{img_analysis}")
     else:
         st.caption("提示：你可以先上傳銀行簡訊截圖、LINE 對話截圖等，這裡會用 Gemini 做初步詐騙判讀。")
 
