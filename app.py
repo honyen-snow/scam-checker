@@ -804,37 +804,40 @@ with tab_sms:
 
 with tab_audio:
     st.markdown("### 🎤 語音求助")
-    st.markdown("請點擊下方麥克風，直接說出你的疑問，或播放可疑的語音訊息讓系統協助判斷。")
+    st.markdown(
+        "### 👉 步驟一：點擊下方麥克風開始錄音。\n"
+        "### 👉 步驟二：錄音完成後，點擊下方的【開始分析語音】按鈕。"
+    )
 
     audio_data = st.audio_input("請點擊麥克風，說出您的問題，或播放可疑的語音訊息給我聽：")
+    run_audio = st.button("開始分析語音", use_container_width=True)
 
-    if audio_data is not None:
-        if not gemini_api_key:
+    if run_audio:
+        if audio_data is None or not audio_data.getvalue():
+            st.warning("⚠️ 系統沒有收到聲音喔！請確認您有按下麥克風並說話。")
+        elif not gemini_api_key:
             st.warning("⚠️ 尚未設定 Gemini API Key，無法進行語音分析。請先在 `.env` 中設定 `GEMINI_API_KEY`。")
         else:
-            if not audio_data.getvalue():
-                st.warning("⚠️ 沒有收到有效的錄音內容，請再試一次。")
-            else:
-                with st.spinner("🧠 正在仔細聆聽並分析語音內容，請稍候..."):
-                    try:
-                        audio_category, audio_analysis = analyze_audio_with_gemini(
-                            audio_file=audio_data,
-                            model_name=gemini_model,
-                            api_key=gemini_api_key,
-                        )
-                    except Exception as e:
-                        audio_category, audio_analysis = "🟡 健康謠言/假新聞", ""
-                        st.warning(f"語音分析失敗，請稍後再試：{e}")
+            with st.spinner("🧠 正在仔細聆聽並分析語音內容，請稍候..."):
+                try:
+                    audio_category, audio_analysis = analyze_audio_with_gemini(
+                        audio_file=audio_data,
+                        model_name=gemini_model,
+                        api_key=gemini_api_key,
+                    )
+                except Exception as e:
+                    audio_category, audio_analysis = "🟡 健康謠言/假新聞", ""
+                    st.warning(f"語音分析失敗，請稍後再試：{e}")
 
-                if audio_analysis:
-                    if audio_category == "🔴 詐騙高風險":
-                        st.error(f"🚨 {audio_category}\n\n{audio_analysis}")
-                    elif audio_category == "🟡 健康謠言/假新聞":
-                        st.warning(f"⚠️ {audio_category}\n\n{audio_analysis}")
-                    else:
-                        st.success(f"✅ {audio_category}\n\n{audio_analysis}")
+            if audio_analysis:
+                if audio_category == "🔴 詐騙高風險":
+                    st.error(f"🚨 {audio_category}\n\n{audio_analysis}")
+                elif audio_category == "🟡 健康謠言/假新聞":
+                    st.warning(f"⚠️ {audio_category}\n\n{audio_analysis}")
+                else:
+                    st.success(f"✅ {audio_category}\n\n{audio_analysis}")
     else:
-        st.caption("提示：請點擊上方麥克風開始錄音，或在支援的裝置上播放可疑語音讓系統協助判斷。")
+        st.caption("提示：請依照步驟錄音，錄完後再按【開始分析語音】進行判斷。")
 
 with st.expander("🧠 這個工具是如何運作的？（點我展開）"):
     st.markdown(
