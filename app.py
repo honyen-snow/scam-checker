@@ -103,9 +103,11 @@ GEMINI_URL_SYSTEM_PROMPT = (
 GEMINI_SMS_SYSTEM_PROMPT = (
     "你是一位『溫暖的銀髮族資訊守門員』，專門協助長者判斷收到的簡訊或 LINE 訊息是否安全。"
     "你會收到：1) 使用者貼上的訊息原文 2) 系統針對訊息內網址做的比對結果（是否命中 165 黑名單、可疑關鍵字）。\n\n"
-    "請嚴格遵循以下分類規則（只能三選一）：\n"
+    "請嚴格遵循以下分類規則（只能四選一）：\n"
     "『🔴 詐騙高風險』：只要內容涉及要求匯款、點擊不明網址、索取驗證碼/個資、宣稱中獎或穩賺不賠的投資。\n"
     "『🟡 健康謠言/假新聞』：內容沒有直接騙錢，但包含誇大的健康恐嚇、未經證實的偏方、或偽造的政府/社會政策。\n"
+    "『🔵 帶風向/情緒煽動疑慮』：內容可能未達直接詐騙或具體健康謠言標準，但充滿強烈情緒字眼、試圖挑起社會對立、"
+    "使用誇大聳動標題、或具有明顯網軍操作特徵的訊息。\n"
     "『🟢 安全與日常資訊』：一般的早安圖文字、真實的新聞、或是無害的親友問候。\n\n"
     "輸出格式必須是『乾淨 JSON』，只能包含兩個欄位：\n"
     '- \"category\"：只能是上述三種標籤其中一個（完全一致）。\n'
@@ -116,9 +118,11 @@ GEMINI_SMS_SYSTEM_PROMPT = (
 GEMINI_AUDIO_SYSTEM_PROMPT = (
     "你是一位親切的銀髮族防詐騙與闢謠志工。請直接聆聽這段音訊，判斷內容是否有詐騙疑慮、"
     "是否屬於健康謠言/假新聞，或只是單純的問候與日常資訊。\n\n"
-    "請嚴格依照以下三種標籤分類（只能三選一）：\n"
+    "請嚴格依照以下標籤分類（只能四選一）：\n"
     "『🔴 詐騙高風險』：內容涉及要求匯款、點擊不明網址、索取驗證碼/個資、宣稱中獎或穩賺不賠的投資。\n"
     "『🟡 健康謠言/假新聞』：內容沒有直接騙錢，但包含誇大的健康恐嚇、未經證實的偏方、或偽造的政府/社會政策。\n"
+    "『🔵 帶風向/情緒煽動疑慮』：內容可能未達直接詐騙或具體健康謠言標準，但充滿強烈情緒字眼、試圖挑起社會對立、"
+    "使用誇大聳動標題、或具有明顯網軍操作特徵的訊息。\n"
     "『🟢 安全與日常資訊』：一般的早安問候、真實新聞朗讀、或無害的親友關心。\n\n"
     "輸出格式必須是乾淨 JSON，只能包含：\n"
     '- \"category\"：上述三種標籤之一（完全一致）。\n'
@@ -461,7 +465,7 @@ def analyze_sms_with_gemini(
     category = (parsed.get("category") or "").strip()
     analysis = (parsed.get("analysis") or "").strip()
 
-    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🟢 安全與日常資訊"}
+    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🔵 帶風向/情緒煽動疑慮", "🟢 安全與日常資訊"}
     if category not in allowed:
         category = "🟡 健康謠言/假新聞" if raw else "🟡 健康謠言/假新聞"
 
@@ -574,7 +578,7 @@ def analyze_audio_with_gemini(
     category = (parsed.get("category") or "").strip()
     analysis = (parsed.get("analysis") or "").strip()
 
-    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🟢 安全與日常資訊"}
+    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🔵 帶風向/情緒煽動疑慮", "🟢 安全與日常資訊"}
     if category not in allowed:
         category = "🟡 健康謠言/假新聞"
 
@@ -613,7 +617,7 @@ with st.sidebar:
     st.markdown("### 🤖 圖片分析（Gemini）")
     gemini_model = st.selectbox(
         "模型",
-        options=["gemini-2.5-flash", "gemini-2.5-pro"],
+        options=["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.0-flash", "gemini-3.1-pro"],
         index=0,
     )
     if gemini_api_key:
@@ -818,6 +822,8 @@ with tab_sms:
             # 依 category 用不同顏色與大表情符號呈現（長者友善）
             if sms_category == "🔴 詐騙高風險":
                 st.error(f"🚨 {sms_category}\n\n{sms_analysis}")
+            elif sms_category == "🔵 帶風向/情緒煽動疑慮":
+                st.info(f"ℹ️ {sms_category}\n\n{sms_analysis}")
             elif sms_category == "🟡 健康謠言/假新聞":
                 st.warning(f"⚠️ {sms_category}\n\n{sms_analysis}")
             else:
@@ -885,6 +891,8 @@ with tab_audio:
             if audio_analysis:
                 if audio_category == "🔴 詐騙高風險":
                     st.error(f"🚨 {audio_category}\n\n{audio_analysis}")
+                elif audio_category == "🔵 帶風向/情緒煽動疑慮":
+                    st.info(f"ℹ️ {audio_category}\n\n{audio_analysis}")
                 elif audio_category == "🟡 健康謠言/假新聞":
                     st.warning(f"⚠️ {audio_category}\n\n{audio_analysis}")
                 else:
