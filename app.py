@@ -9,6 +9,7 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
+import re
 
 import google.generativeai as genai
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -97,6 +98,14 @@ GEMINI_URL_SYSTEM_PROMPT = (
     "寫給一般民眾看的防詐騙分析報告；若風險較高要明確提醒與給建議，若目前看起來安全也要提醒保持警覺。"
 )
 
+GEMINI_SMS_SYSTEM_PROMPT = (
+    "你是一位台灣警政署 165 級別的防詐騙專家。你會收到一段疑似詐騙的簡訊或 LINE 訊息，"
+    "以及系統針對其中網址做的技術性比對結果。"
+    "請用溫暖、有耐心、同理心強、條理清楚且盡量少用艱深科技術語的繁體中文來說明，"
+    "讀者多為一般民眾與視力可能較退化的長者。"
+    "請在報告最後明確給出『高度危險』、『有疑慮』或『目前無明顯特徵』三種之一的結論。"
+)
+
 
 def _normalize_domain(raw_url: str) -> str:
     s = (raw_url or "").strip()
@@ -167,6 +176,30 @@ def _extract_urls_from_csv_df(df: pd.DataFrame) -> list[str]:
 def _extract_urls_from_csv_text(csv_text: str) -> list[str]:
     df = pd.read_csv(io.StringIO(csv_text))
     return _extract_urls_from_csv_df(df)
+
+
+def extract_urls_from_text(text: str) -> list[str]:
+    """從簡訊文字中以正規表達式萃取網址（含 http/https 及部分裸網域）。"""
+    if not text:
+        return []
+
+    urls: set[str] = set()
+
+    # 1) 先抓 http/https 開頭的完整網址
+    pattern_http = re.compile(r"https?://[^\s<>\"']+")
+    for match in pattern_http.findall(text):
+        urls.add(match.strip().strip("。，、,.!?；;"))
+
+    # 2) 再抓像 example.com/path 這種無協定的網址
+    pattern_domain = re.compile(
+        r"\b(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|tw|top|vip|icu|click|shop|live|cc|pw)(?:/[^\s<>\"']*)?"
+    )
+    for match in pattern_domain.findall(text):
+        # 避免重複已抓過的 http/https
+        if not match.startswith("http://") and not match.startswith("https://"):
+            urls.add(match.strip().strip("。，、,.!?；;"))
+
+    return sorted(urls)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -303,6 +336,59 @@ def analyze_url_with_gemini(
     return (getattr(resp, "text", None) or "").strip()
 
 
+def analyze_sms_with_gemini(
+    *,
+    sms_text: str,
+    url_summaries: list[dict],
+    model_name: str,
+    api_key: str,
+) -> tuple[str, str]:
+    """根據簡訊內容與黑名單比對結果，請 Gemini 給出分析與結論。"""
+    if not url_summaries:
+        urls_section = "系統沒有在訊息中偵測到明確的網址或連結。"
+    else:
+        lines = []
+        for info in url_summaries:
+            u = info.get("original_url") or info.get("cleaned") or ""
+            domain = info.get("normalized_domain") or "（無法解析）"
+            in_blacklist = info.get("in_blacklist")
+            hits = info.get("keyword_hits") or []
+            blacklist_text = "是，已命中 165 詐騙黑名單。" if in_blacklist else "否，目前未出現在 165 詐騙黑名單中。"
+            keyword_text = "、".join(hits) if hits else "無特別命中的可疑關鍵字。"
+            lines.append(
+                f"- 原始網址：{u}\n  - 網域：{domain}\n  - 是否在 165 黑名單：{blacklist_text}\n  - 命中的關鍵字：{keyword_text}"
+            )
+        urls_section = "\n".join(lines)
+
+    technical_summary = (
+        "【系統技術檢查摘要】\n"
+        + urls_section
+        + "\n\n"
+        "請你參考以上技術檢查結果，再結合下一段的訊息原文，幫助使用者判斷風險。"
+    )
+
+    user_prompt = (
+        technical_summary
+        + "\n\n【使用者貼上的簡訊 / LINE 訊息原文】\n"
+        + sms_text
+        + "\n\n請你：\n"
+        "1) 用淺顯易懂的語言，說明這則訊息可能涉及的風險與常見詐騙手法（若目前看起來風險不高，也請說明原因以及仍需注意的地方）。\n"
+        "2) 列出 3-5 個具體建議步驟，告訴使用者現在應該怎麼做比較安全。\n"
+        "3) 在最後明確寫出一句『結論：XXX』，其中 XXX 必須是「高度危險」、「有疑慮」或「目前無明顯特徵」三選一。\n"
+        "4) 全程請使用繁體中文，語氣溫暖、有同理心，適合一般民眾與長者閱讀。\n"
+    )
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=GEMINI_SMS_SYSTEM_PROMPT,
+    )
+    resp = model.generate_content(user_prompt)
+    report = (getattr(resp, "text", None) or "").strip()
+    risk_label = _pick_risk_level(report)
+    return risk_label, report
+
+
 def analyze_image_with_gemini(
     *,
     image_file,
@@ -388,7 +474,9 @@ with st.sidebar:
 
 blacklist, blacklist_status = load_external_blacklist(source_url)
 
-tab_url, tab_image = st.tabs(["🌐 網址檢查", "🖼️ 圖片/截圖檢查"])
+tab_url, tab_image, tab_sms = st.tabs(
+    ["🌐 網址檢查", "🖼️ 圖片/截圖檢查", "📝 簡訊文字分析"]
+)
 
 with tab_url:
     top_left, top_right = st.columns([3, 2], vertical_alignment="top")
@@ -534,6 +622,73 @@ with tab_image:
             st.caption(f"模型：`{result.get('model', gemini_model)}`")
     else:
         st.caption("提示：你可以先上傳銀行簡訊截圖、LINE 對話截圖等，這裡會用 Gemini 做初步詐騙判讀。")
+
+with tab_sms:
+    st.markdown("### 📝 簡訊文字分析")
+    st.markdown("### 請貼上可疑的簡訊或 LINE 訊息內容")
+
+    sms_text = st.text_area(
+        label="",
+        placeholder="例如：\n【重要通知】您帳戶異常，請立即登入 https://example.com/login 更新資料，否則將凍結帳戶。",
+        height=180,
+    )
+
+    sms_analyze = st.button("📨 分析這則訊息", use_container_width=True)
+
+    if sms_analyze:
+        if not (sms_text or "").strip():
+            st.warning("⚠️ 請先貼上一段簡訊或 LINE 訊息，再按『分析這則訊息』。")
+        elif not gemini_api_key:
+            st.error("❌ 找不到 Gemini API Key。請先在 `.env` 中設定 `GEMINI_API_KEY`，再重新啟動程式。")
+        else:
+            urls_in_sms = extract_urls_from_text(sms_text)
+
+            url_summaries: list[dict] = []
+            for u in urls_in_sms:
+                _, d = check_url(u, blacklist)
+                d_with_original = dict(d)
+                d_with_original["original_url"] = u
+                url_summaries.append(d_with_original)
+
+            with st.spinner("🧠 Gemini 正在閱讀這則訊息並進行防詐分析..."):
+                try:
+                    sms_risk, sms_report = analyze_sms_with_gemini(
+                        sms_text=sms_text,
+                        url_summaries=url_summaries,
+                        model_name=gemini_model,
+                        api_key=gemini_api_key,
+                    )
+                except Exception as e:
+                    sms_risk, sms_report = "有疑慮", ""
+                    st.error(f"分析失敗：{e}")
+
+            # 先用醒目的顏色與大表情符號顯示結論
+            if sms_risk == "高度危險":
+                st.error("🚨 判定：這則訊息具有高度詐騙風險，務必不要依照內容操作。")
+            elif sms_risk == "目前無明顯特徵":
+                st.success("✅ 判定：目前未見明顯詐騙特徵，但仍請保持警覺。")
+            else:
+                st.warning("⚠️ 判定：這則訊息有疑慮，請提高警覺並再次求證。")
+
+            if urls_in_sms:
+                with st.expander("🔍 系統偵測到的網址與黑名單比對結果"):
+                    for info in url_summaries:
+                        u = info.get("original_url") or ""
+                        domain = info.get("normalized_domain") or "（無法解析）"
+                        in_blacklist = info.get("in_blacklist")
+                        hits = info.get("keyword_hits") or []
+                        st.write(f"- **網址**：`{u}`")
+                        st.write(f"  - 網域：`{domain}`")
+                        st.write(f"  - 是否在 165 黑名單：{'是' if in_blacklist else '否'}")
+                        if hits:
+                            st.write(f"  - 命中的可疑關鍵字：{'、'.join(hits)}")
+                        st.write("---")
+            else:
+                st.caption("系統沒有在這則訊息中偵測到明顯的網址。")
+
+            if sms_report:
+                st.markdown("### 🤖 AI 防詐騙說明")
+                st.markdown(sms_report)
 
 with st.expander("🧠 這個工具是如何運作的？（點我展開）"):
     st.markdown(
