@@ -112,6 +112,19 @@ GEMINI_SMS_SYSTEM_PROMPT = (
     "非常重要：只輸出 JSON，不要加任何多餘文字、不要 Markdown、不要程式碼區塊。"
 )
 
+GEMINI_AUDIO_SYSTEM_PROMPT = (
+    "你是一位親切的銀髮族防詐騙與闢謠志工。請直接聆聽這段音訊，判斷內容是否有詐騙疑慮、"
+    "是否屬於健康謠言/假新聞，或只是單純的問候與日常資訊。\n\n"
+    "請嚴格依照以下三種標籤分類（只能三選一）：\n"
+    "『🔴 詐騙高風險』：內容涉及要求匯款、點擊不明網址、索取驗證碼/個資、宣稱中獎或穩賺不賠的投資。\n"
+    "『🟡 健康謠言/假新聞』：內容沒有直接騙錢，但包含誇大的健康恐嚇、未經證實的偏方、或偽造的政府/社會政策。\n"
+    "『🟢 安全與日常資訊』：一般的早安問候、真實新聞朗讀、或無害的親友關心。\n\n"
+    "輸出格式必須是乾淨 JSON，只能包含：\n"
+    '- \"category\"：上述三種標籤之一（完全一致）。\n'
+    '- \"analysis\"：用對待長輩般親切、好懂的白話文（約 100-150 字），說明為什麼這樣分類並給出建議。\n\n'
+    "請不要輸出任何額外說明或 Markdown，只輸出 JSON。"
+)
+
 
 def _normalize_domain(raw_url: str) -> str:
     s = (raw_url or "").strip()
@@ -466,6 +479,67 @@ def analyze_image_with_gemini(
     }
 
 
+def analyze_audio_with_gemini(
+    *,
+    audio_file,
+    model_name: str,
+    api_key: str,
+) -> tuple[str, str]:
+    """使用 Gemini 針對語音進行三分類並回傳 (category, analysis)。"""
+    audio_bytes = audio_file.getvalue()
+    if not audio_bytes:
+        return "🟡 健康謠言/假新聞", "（沒有收到有效的語音資料。）"
+
+    mime_type = getattr(audio_file, "type", None) or "audio/wav"
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=GEMINI_AUDIO_SYSTEM_PROMPT,
+    )
+
+    audio_part = {
+        "mime_type": mime_type,
+        "data": audio_bytes,
+    }
+
+    user_prompt = "請依照系統提示的三分類規則輸出 JSON。"
+
+    resp = model.generate_content([audio_part, user_prompt])
+    raw = (getattr(resp, "text", None) or "").strip()
+
+    def _parse_json(text: str) -> dict | None:
+        t = (text or "").strip()
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = re.sub(r"\s*```$", "", t).strip()
+        if not t:
+            return None
+        try:
+            return json.loads(t)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", t)
+            if not m:
+                return None
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+
+    parsed = _parse_json(raw) or {}
+    category = (parsed.get("category") or "").strip()
+    analysis = (parsed.get("analysis") or "").strip()
+
+    allowed = {"🔴 詐騙高風險", "🟡 健康謠言/假新聞", "🟢 安全與日常資訊"}
+    if category not in allowed:
+        category = "🟡 健康謠言/假新聞"
+
+    if not analysis:
+        analysis = raw or "（AI 沒有回傳可解析的 JSON 內容，建議稍後再試一次。）"
+
+    return category, analysis
+
+
 # =========================
 # UI
 # =========================
@@ -505,8 +579,8 @@ with st.sidebar:
 
 blacklist, blacklist_status = load_external_blacklist(source_url)
 
-tab_url, tab_image, tab_sms = st.tabs(
-    ["🌐 網址檢查", "🖼️ 圖片/截圖檢查", "📝 簡訊文字分析"]
+tab_url, tab_image, tab_sms, tab_audio = st.tabs(
+    ["🌐 網址檢查", "🖼️ 圖片/截圖檢查", "📝 簡訊文字分析", "🎤 語音求助"]
 )
 
 with tab_url:
@@ -727,6 +801,40 @@ with tab_sms:
                         st.write("---")
                 else:
                     st.write("目前沒有網址可供 165 黑名單比對。")
+
+with tab_audio:
+    st.markdown("### 🎤 語音求助")
+    st.markdown("請點擊下方麥克風，直接說出你的疑問，或播放可疑的語音訊息讓系統協助判斷。")
+
+    audio_data = st.audio_input("請點擊麥克風，說出您的問題，或播放可疑的語音訊息給我聽：")
+
+    if audio_data is not None:
+        if not gemini_api_key:
+            st.warning("⚠️ 尚未設定 Gemini API Key，無法進行語音分析。請先在 `.env` 中設定 `GEMINI_API_KEY`。")
+        else:
+            if not audio_data.getvalue():
+                st.warning("⚠️ 沒有收到有效的錄音內容，請再試一次。")
+            else:
+                with st.spinner("🧠 正在仔細聆聽並分析語音內容，請稍候..."):
+                    try:
+                        audio_category, audio_analysis = analyze_audio_with_gemini(
+                            audio_file=audio_data,
+                            model_name=gemini_model,
+                            api_key=gemini_api_key,
+                        )
+                    except Exception as e:
+                        audio_category, audio_analysis = "🟡 健康謠言/假新聞", ""
+                        st.warning(f"語音分析失敗，請稍後再試：{e}")
+
+                if audio_analysis:
+                    if audio_category == "🔴 詐騙高風險":
+                        st.error(f"🚨 {audio_category}\n\n{audio_analysis}")
+                    elif audio_category == "🟡 健康謠言/假新聞":
+                        st.warning(f"⚠️ {audio_category}\n\n{audio_analysis}")
+                    else:
+                        st.success(f"✅ {audio_category}\n\n{audio_analysis}")
+    else:
+        st.caption("提示：請點擊上方麥克風開始錄音，或在支援的裝置上播放可疑語音讓系統協助判斷。")
 
 with st.expander("🧠 這個工具是如何運作的？（點我展開）"):
     st.markdown(
